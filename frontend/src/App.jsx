@@ -2,19 +2,9 @@ import { useEffect, useMemo, useRef, useState } from "react";
 import "./App.css";
 
 const API_BASE = "http://127.0.0.1:8000";
+const CACHE_KEY = "chromafm_bundle_v1";
 
-const ORDER = [
-  "white",
-  "grey",
-  "black",
-  "red",
-  "orange",
-  "yellow",
-  "green",
-  "blue",
-  "purple",
-  "pink",
-];
+const ORDER = ["white", "grey", "black", "red", "orange", "yellow", "green", "blue", "purple", "pink"];
 
 const BUCKET_BORDER = {
   white: "#FFFFFF",
@@ -27,6 +17,12 @@ const BUCKET_BORDER = {
   blue: "#1E88E5",
   purple: "#8E24AA",
   pink: "#EC407A",
+};
+
+const TIME_ORDER = {
+  short_term: ["short_term", "medium_term", "long_term"],
+  medium_term: ["medium_term", "short_term", "long_term"],
+  long_term: ["long_term", "medium_term", "short_term"],
 };
 
 function titleCase(color) {
@@ -50,66 +46,14 @@ function srgbToLin(c) {
 function pickTextColor(bgHex) {
   const rgb = parseHex(bgHex);
   if (!rgb) return "#F3F3F3";
-  const R = srgbToLin(rgb.r);
-  const G = srgbToLin(rgb.g);
-  const B = srgbToLin(rgb.b);
-  const L = 0.2126 * R + 0.7152 * G + 0.0722 * B;
+  const L = 0.2126 * srgbToLin(rgb.r) + 0.7152 * srgbToLin(rgb.g) + 0.0722 * srgbToLin(rgb.b);
   return L > 0.58 ? "#0E0E0E" : "#F3F3F3";
 }
-
-function preloadImagesFromBundle(bundle) {
-  try {
-    const urls = new Set();
-    for (const tr of ["short_term", "medium_term", "long_term"]) {
-      const result = bundle?.[tr]?.result;
-      if (!result) continue;
-      for (const color of ORDER) {
-        const top = result?.[color]?.top;
-        if (top?.image) urls.add(top.image);
-      }
-    }
-    urls.forEach((u) => {
-      const img = new Image();
-      img.decoding = "async";
-      img.loading = "eager";
-      img.src = u;
-    });
-  } catch {}
-}
-
-function getTopFrom(bundle, timeRange, color) {
-  const data = bundle?.[timeRange];
-  const result = data?.result || data?.buckets || null;
-  const top =
-    result?.[color]?.top ?? (Array.isArray(result?.[color]) ? result[color][0] : null);
-  return top || null;
-}
-
-function getTopWithCrossTimeFallback(bundle, timeRange, color) {
-  const order =
-    timeRange === "short_term"
-      ? ["short_term", "medium_term", "long_term"]
-      : timeRange === "medium_term"
-      ? ["medium_term", "short_term", "long_term"]
-      : ["long_term", "medium_term", "short_term"];
-
-  for (const tr of order) {
-    const top = getTopFrom(bundle, tr, color);
-    if (top) return { top: { ...top }, fromRange: tr };
-  }
-  return { top: null, fromRange: null };
-}
-
-// ---------- SHARE IMAGE GENERATOR (1080x1920) ----------
 
 function timeRangeLabel(tr) {
   if (tr === "short_term") return "Last 4 weeks";
   if (tr === "medium_term") return "Last 6 months";
   return "All time";
-}
-
-function hexOrFallback(top, color) {
-  return top?.hex || BUCKET_BORDER[color] || "#111111";
 }
 
 function proxyUrl(url) {
@@ -119,10 +63,45 @@ function proxyUrl(url) {
 async function loadImageBitmapViaProxy(url) {
   const res = await fetch(proxyUrl(url));
   if (!res.ok) throw new Error("image fetch failed");
-  const blob = await res.blob();
-  const bmp = await createImageBitmap(blob);
-  return bmp;
+  return createImageBitmap(await res.blob());
 }
+
+function preloadImagesFromBundle(bundle) {
+  try {
+    const urls = new Set();
+    for (const tr of ["short_term", "medium_term", "long_term"]) {
+      const result = bundle?.[tr]?.result;
+      if (!result) continue;
+      for (const color of ORDER) {
+        const u = result?.[color]?.top?.image;
+        if (u) urls.add(u);
+      }
+    }
+    for (const u of urls) {
+      const img = new Image();
+      img.decoding = "async";
+      img.loading = "eager";
+      img.src = u;
+    }
+  } catch {}
+}
+
+function getTopFrom(bundle, timeRange, color) {
+  const data = bundle?.[timeRange];
+  const result = data?.result || data?.buckets || null;
+  const bucket = result?.[color];
+  return bucket?.top ?? (Array.isArray(bucket) ? bucket[0] : null) ?? null;
+}
+
+function getTopWithCrossTimeFallback(bundle, timeRange, color) {
+  for (const tr of TIME_ORDER[timeRange] || TIME_ORDER.short_term) {
+    const top = getTopFrom(bundle, tr, color);
+    if (top) return { top: { ...top }, fromRange: tr };
+  }
+  return { top: null, fromRange: null };
+}
+
+// ---------- Story Export (1080x1920) ----------
 
 function roundRect(ctx, x, y, w, h, r) {
   const rr = Math.max(0, Math.min(r, Math.min(w, h) / 2));
@@ -136,123 +115,80 @@ function roundRect(ctx, x, y, w, h, r) {
 }
 
 function drawCoverContain(ctx, bmp, x, y, size) {
-  const iw = bmp.width;
-  const ih = bmp.height;
-  const scale = Math.min(size / iw, size / ih);
-  const dw = iw * scale;
-  const dh = ih * scale;
-  const dx = x + (size - dw) / 2;
-  const dy = y + (size - dh) / 2;
-  ctx.drawImage(bmp, dx, dy, dw, dh);
+  const scale = Math.min(size / bmp.width, size / bmp.height);
+  const dw = bmp.width * scale;
+  const dh = bmp.height * scale;
+  ctx.drawImage(bmp, x + (size - dw) / 2, y + (size - dh) / 2, dw, dh);
 }
 
 function ellipsize(ctx, text, maxWidth) {
   if (!text) return "";
   if (ctx.measureText(text).width <= maxWidth) return text;
-  let s = text;
-  while (s.length > 0 && ctx.measureText(s + "…").width > maxWidth) {
-    s = s.slice(0, -1);
-  }
+  let s = String(text);
+  while (s.length > 0 && ctx.measureText(s + "…").width > maxWidth) s = s.slice(0, -1);
   return s.length ? s + "…" : "";
 }
 
-async function buildStoryPng({ tiles, timeRange }) {
-  // Story size
+function fitOneLineText(ctx, text, maxWidth, startPx, minPx) {
+  let size = startPx;
+  while (size > minPx) {
+    ctx.font = `800 ${size}px system-ui, -apple-system, Segoe UI, Roboto, Arial`;
+    if (ctx.measureText(text).width <= maxWidth) break;
+    size -= 1;
+  }
+  ctx.font = `800 ${size}px system-ui, -apple-system, Segoe UI, Roboto, Arial`;
+  return size;
+}
+
+function wrapAtSpaces(ctx, text, maxWidth, fontPx, maxLines) {
+  const words = String(text || "").trim().split(/\s+/).filter(Boolean);
+  if (!words.length) return null;
+
+  ctx.font = `800 ${fontPx}px system-ui, -apple-system, Segoe UI, Roboto, Arial`;
+
+  const lines = [];
+  let current = "";
+
+  for (const w of words) {
+    const test = current ? `${current} ${w}` : w;
+    if (ctx.measureText(test).width <= maxWidth) {
+      current = test;
+    } else {
+      if (current) lines.push(current);
+      current = w;
+      if (lines.length === maxLines - 1) break;
+    }
+  }
+  if (current && lines.length < maxLines) lines.push(current);
+  return lines.length ? lines : null;
+}
+
+async function buildPng({ tiles, timeRange }) {
   const W = 1080;
   const H = 1920;
+  const pad = 64;
+  const headerH = 220;
 
   const canvas = document.createElement("canvas");
   canvas.width = W;
   canvas.height = H;
   const ctx = canvas.getContext("2d");
 
-  // ---------- helpers (local to this function) ----------
-  function timeRangeLabel(tr) {
-    if (tr === "short_term") return "Last 4 weeks";
-    if (tr === "medium_term") return "Last 6 months";
-    return "All time";
-  }
-
-  function hexOrFallback(top, color) {
-    return top?.hex || BUCKET_BORDER[color] || "#111111";
-  }
-
-  function fitOneLineText(ctx, text, maxWidth, startPx, minPx) {
-    let size = startPx;
-    ctx.font = `800 ${size}px system-ui, -apple-system, Segoe UI, Roboto, Arial`;
-    while (size > minPx && ctx.measureText(text).width > maxWidth) {
-      size -= 1;
-      ctx.font = `800 ${size}px system-ui, -apple-system, Segoe UI, Roboto, Arial`;
-    }
-    return size;
-  }
-
-  function ellipsize(ctx, text, maxWidth) {
-    if (!text) return "";
-    if (ctx.measureText(text).width <= maxWidth) return text;
-    let s = text;
-    while (s.length > 0 && ctx.measureText(s + "…").width > maxWidth) {
-      s = s.slice(0, -1);
-    }
-    return s.length ? s + "…" : "";
-  }
-
-  // ✅ NEW: if it doesn't fit at min font, split into 2 lines ONLY at spaces
-  function splitIntoLinesAtSpaces(ctx, text, maxWidth, fontPx, maxLines) {
-    const words = String(text || "").trim().split(/\s+/).filter(Boolean);
-    if (!words.length) return null;
-
-    ctx.font = `800 ${fontPx}px system-ui, -apple-system, Segoe UI, Roboto, Arial`;
-
-    const lines = [];
-    let current = "";
-
-    for (const word of words) {
-        const test = current ? `${current} ${word}` : word;
-        if (ctx.measureText(test).width <= maxWidth) {
-        current = test;
-        } else {
-        if (current) lines.push(current);
-        current = word;
-        if (lines.length === maxLines - 1) break;
-        }
-    }
-
-    if (current && lines.length < maxLines) lines.push(current);
-
-    return lines.length ? lines : null;
-  }
-
-  function roundRect(ctx, x, y, w, h, r) {
-    const rr = Math.max(0, Math.min(r, Math.min(w, h) / 2));
-    ctx.beginPath();
-    ctx.moveTo(x + rr, y);
-    ctx.arcTo(x + w, y, x + w, y + h, rr);
-    ctx.arcTo(x + w, y + h, x, y + h, rr);
-    ctx.arcTo(x, y + h, x, y, rr);
-    ctx.arcTo(x, y, x + w, y, rr);
-    ctx.closePath();
-  }
-
-  function drawCoverContain(ctx, bmp, x, y, size) {
-    const iw = bmp.width;
-    const ih = bmp.height;
-    const scale = Math.min(size / iw, size / ih);
-    const dw = iw * scale;
-    const dh = ih * scale;
-    const dx = x + (size - dw) / 2;
-    const dy = y + (size - dh) / 2;
-    ctx.drawImage(bmp, dx, dy, dw, dh);
-  }
-
-  // ---------- background ----------
+  // background
   ctx.fillStyle = "#0e0e0e";
   ctx.fillRect(0, 0, W, H);
 
-  // ---------- layout ----------
-  const pad = 64;
-  const headerH = 220;
+  // header
+  ctx.fillStyle = "#f3f3f3";
+  ctx.font = "800 72px system-ui, -apple-system, Segoe UI, Roboto, Arial";
+  ctx.fillText("ChromaFM", pad, pad + 72);
 
+  ctx.fillStyle = "rgba(243,243,243,0.8)";
+  ctx.font = "500 34px system-ui, -apple-system, Segoe UI, Roboto, Arial";
+  ctx.fillText("A colorful way to view your favorite albums.", pad, pad + 132);
+  ctx.fillText(timeRangeLabel(timeRange), pad, pad + 192);
+
+  // grid layout
   const gridTop = pad + headerH;
   const gridLeft = pad;
   const gridRight = W - pad;
@@ -267,45 +203,31 @@ async function buildStoryPng({ tiles, timeRange }) {
   const cellW = (gridW - gap * (cols - 1)) / cols;
   const cellH = (gridH - gap * (rows - 1)) / rows;
 
-  // ---------- header ----------
-  ctx.fillStyle = "#f3f3f3";
-  ctx.font = "800 72px system-ui, -apple-system, Segoe UI, Roboto, Arial";
-  ctx.fillText("ChromaFM", pad, pad + 72);
-
-  ctx.fillStyle = "rgba(243,243,243,0.8)";
-  ctx.font = "500 34px system-ui, -apple-system, Segoe UI, Roboto, Arial";
-  ctx.fillText("A colorful way to view your favorite albums.", pad, pad + 132);
-
-  ctx.fillStyle = "rgba(243,243,243,0.8)";
-  ctx.font = "500 34px system-ui, -apple-system, Segoe UI, Roboto, Arial";
-  ctx.fillText(timeRangeLabel(timeRange), pad, pad + 192);
-
-  // ---------- preload cover bitmaps ----------
+  // preload covers
   const coverBitmaps = await Promise.all(
     tiles.map(async (t) => {
-      if (!t?.top?.image) return null;
+      const u = t?.top?.image;
+      if (!u) return null;
       try {
-        return await loadImageBitmapViaProxy(t.top.image);
+        return await loadImageBitmapViaProxy(u);
       } catch {
         return null;
       }
     })
   );
 
-  // ---------- tiles ----------
   for (let i = 0; i < tiles.length; i++) {
     const t = tiles[i];
     const col = i % cols;
     const row = Math.floor(i / cols);
-
     const x = gridLeft + col * (cellW + gap);
     const y = gridTop + row * (cellH + gap);
 
-    const bg = hexOrFallback(t.top, t.color);
+    const bg = t.top?.hex || BUCKET_BORDER[t.color] || "#111111";
     const border = BUCKET_BORDER[t.color] || "#ffffff";
     const fg = pickTextColor(bg);
 
-    // tile background (sharp)
+    // tile bg
     ctx.save();
     roundRect(ctx, x, y, cellW, cellH, 0);
     ctx.clip();
@@ -318,16 +240,14 @@ async function buildStoryPng({ tiles, timeRange }) {
     ctx.lineWidth = 6;
     ctx.strokeRect(x + 3, y + 3, cellW - 6, cellH - 6);
 
-    // tighter padding to leave less gaps
+    // inner layout
     const inPad = 18;
     const gapX = 16;
-
     const innerX = x + inPad;
     const innerY = y + inPad;
     const innerW = cellW - inPad * 2;
     const innerH = cellH - inPad * 2;
 
-    // bigger cover
     const coverSize = Math.min(innerH * 0.92, innerW * 0.64);
     const coverX = innerX;
     const coverY = innerY + (innerH - coverSize) / 2;
@@ -335,18 +255,15 @@ async function buildStoryPng({ tiles, timeRange }) {
     const textX = coverX + coverSize + gapX;
     const textW = innerX + innerW - textX;
 
-    // cover outline only
+    // cover outline
     ctx.strokeStyle = "rgba(0,0,0,0.35)";
     ctx.lineWidth = 3;
     ctx.strokeRect(coverX, coverY, coverSize, coverSize);
 
     const bmp = coverBitmaps[i];
-    if (bmp) {
-      // 100% visible cover (contain); no bars added (tile bg shows through)
-      drawCoverContain(ctx, bmp, coverX, coverY, coverSize);
-    }
+    if (bmp) drawCoverContain(ctx, bmp, coverX, coverY, coverSize);
 
-    // -------- title + artist + hex on the right --------
+    // text
     const name = t.top?.name || "No album";
     const artist = t.top?.artist || "";
 
@@ -354,46 +271,29 @@ async function buildStoryPng({ tiles, timeRange }) {
 
     const titleStart = 34;
     const titleMin = 18;
-
-    // Try 1-line scale first
-    const titlePx = fitOneLineText(ctx, name, textW, titleStart, titleMin);
-
     const baseTitleY = coverY + 40;
 
-    // If still too wide at min size, wrap to 2 lines at spaces
-    ctx.font = `800 ${titlePx}px system-ui, -apple-system, Segoe UI, Roboto, Arial`;
-    const needsWrap = ctx.measureText(name).width > textW && titlePx === titleMin;
+    const usedTitlePx = fitOneLineText(ctx, name, textW, titleStart, titleMin);
+    const needsWrap = usedTitlePx === titleMin && ctx.measureText(name).width > textW;
 
-    let titleLineCount = 1;
-    let usedTitlePx = titlePx;
-
+    let titleLines = 1;
     if (needsWrap) {
-      // Ensure we're measuring at min size
-      usedTitlePx = titleMin;
-
-      const lines = splitIntoLinesAtSpaces(ctx, name, textW, usedTitlePx, 4);
-
+      const lines = wrapAtSpaces(ctx, name, textW, titleMin, 4);
       if (lines) {
-        titleLineCount = lines.length;
-        ctx.font = `800 ${usedTitlePx}px system-ui, -apple-system, Segoe UI, Roboto, Arial`;
-
+        titleLines = lines.length;
         const lineGap = 6;
         for (let li = 0; li < lines.length; li++) {
-            ctx.fillText(lines[li], textX, baseTitleY + li * (usedTitlePx + lineGap));
-      }
-        } else {
-        // Single-word edge case: fallback to ellipsis
-        ctx.font = `800 ${usedTitlePx}px system-ui, -apple-system, Segoe UI, Roboto, Arial`;
+          ctx.fillText(lines[li], textX, baseTitleY + li * (titleMin + lineGap));
+        }
+      } else {
         ctx.fillText(ellipsize(ctx, name, textW), textX, baseTitleY);
       }
     } else {
-      ctx.font = `800 ${usedTitlePx}px system-ui, -apple-system, Segoe UI, Roboto, Arial`;
       ctx.fillText(ellipsize(ctx, name, textW), textX, baseTitleY);
     }
 
-    // Artist: smaller, lighter
     const artistPx = Math.max(18, Math.min(24, Math.floor(usedTitlePx * 0.72)));
-    const artistY = baseTitleY + (titleLineCount - 1) * (usedTitlePx + 6) + 40;
+    const artistY = baseTitleY + (titleLines - 1) * (usedTitlePx + 6) + 40;
 
     ctx.save();
     ctx.globalAlpha = 0.88;
@@ -401,15 +301,13 @@ async function buildStoryPng({ tiles, timeRange }) {
     ctx.fillText(ellipsize(ctx, artist, textW), textX, artistY);
     ctx.restore();
 
-    // tiny hex under artist
     const hex = t.top?.hex ? String(t.top.hex) : "";
     if (hex) {
-      const hexY = artistY + 32;
       ctx.save();
       ctx.globalAlpha = 0.72;
       ctx.font = "600 20px system-ui, -apple-system, Segoe UI, Roboto, Arial";
       ctx.fillStyle = fg;
-      ctx.fillText(ellipsize(ctx, hex, textW), textX, hexY);
+      ctx.fillText(ellipsize(ctx, hex, textW), textX, artistY + 32);
       ctx.restore();
     }
   }
@@ -431,30 +329,24 @@ function downloadCanvasPng(canvas, filename) {
   }, "image/png");
 }
 
-// ------------------------------------------------------
+// ---------- App ----------
 
 export default function App() {
   const [bundle, setBundle] = useState(null);
   const [timeRange, setTimeRange] = useState("short_term");
   const [error, setError] = useState("");
-  const [isRefreshing, setIsRefreshing] = useState(false);
   const [isExporting, setIsExporting] = useState(false);
+  const didHydrate = useRef(false);
 
-  const isLoggedOut =
-    !!error && (error.includes("Not logged in") || error.includes("401"));
-
-  const didHydrateFromCache = useRef(false);
+  const isLoggedOut = !!error && (error.includes("Not logged in") || error.includes("401"));
+  const hasResult = !!bundle?.[timeRange]?.result;
 
   async function loadBundle({ background = false } = {}) {
     try {
-      if (background) setIsRefreshing(true);
-      setError("");
-
-      const res = await fetch(`${API_BASE}/api/results_bundle`, {
-        credentials: "include",
-      });
-
+      if (!background) setError("");
+      const res = await fetch(`${API_BASE}/api/results_bundle`, { credentials: "include" });
       const text = await res.text();
+
       let json;
       try {
         json = JSON.parse(text);
@@ -465,47 +357,39 @@ export default function App() {
       if (!res.ok) throw new Error(json.error || "Failed to load results bundle");
 
       setBundle(json);
-      sessionStorage.setItem("chromafm_bundle_v1", JSON.stringify(json));
+      sessionStorage.setItem(CACHE_KEY, JSON.stringify(json));
       preloadImagesFromBundle(json);
     } catch (e) {
       setError(String(e));
-    } finally {
-      setIsRefreshing(false);
     }
   }
 
-async function logout() {
-  try {
-    await fetch(`${API_BASE}/logout`, {
-      method: "POST",
-      credentials: "include",
-    });
-  } finally {
-    setBundle(null);
-    setError("Not logged in");
-    sessionStorage.removeItem("chromafm_bundle_v1");
+  async function logout() {
+    try {
+      await fetch(`${API_BASE}/logout`, { method: "POST", credentials: "include" });
+    } finally {
+      setBundle(null);
+      setError("Not logged in");
+      sessionStorage.removeItem(CACHE_KEY);
+    }
   }
-}
 
   useEffect(() => {
-    if (!didHydrateFromCache.current) {
-      didHydrateFromCache.current = true;
-      const cached = sessionStorage.getItem("chromafm_bundle_v1");
-      if (cached) {
-        try {
-          const parsed = JSON.parse(cached);
-          setBundle(parsed);
-          preloadImagesFromBundle(parsed);
-          loadBundle({ background: true });
-          return;
-        } catch {}
-      }
+    if (didHydrate.current) return;
+    didHydrate.current = true;
+
+    const cached = sessionStorage.getItem(CACHE_KEY);
+    if (cached) {
+      try {
+        const parsed = JSON.parse(cached);
+        setBundle(parsed);
+        preloadImagesFromBundle(parsed);
+        loadBundle({ background: true });
+        return;
+      } catch {}
     }
     loadBundle();
-    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
-
-  const hasResult = !!(bundle?.[timeRange]?.result);
 
   const tiles = useMemo(() => {
     if (!bundle) return [];
@@ -515,14 +399,12 @@ async function logout() {
     });
   }, [bundle, timeRange]);
 
-  async function onDownloadStory() {
+  async function onDownloadPic() {
     try {
       if (!hasResult) return;
       setIsExporting(true);
-
-      const canvas = await buildStoryPng({ tiles, timeRange });
-      const fname = `chromafm-${timeRange}-${Date.now()}.png`;
-      downloadCanvasPng(canvas, fname);
+      const canvas = await buildPng({ tiles, timeRange });
+      downloadCanvasPng(canvas, `chromafm-${timeRange}-${Date.now()}.png`);
     } catch (e) {
       setError(String(e));
     } finally {
@@ -550,13 +432,13 @@ async function logout() {
 
             <button
               className="pillBtn"
-              onClick={onDownloadStory}
+              onClick={onDownloadPic}
               type="button"
               disabled={!hasResult || isExporting}
               style={{ opacity: !hasResult ? 0.5 : 1 }}
-              title={!hasResult ? "Log in and load albums first" : "Download 1080×1920 story"}
+              title={!hasResult ? "Log in and load albums first" : "Download a 1080×1920 picture"}
             >
-              {isExporting ? "Exporting…" : "Download Story"}
+              {isExporting ? "Exporting…" : "Download Picture"}
             </button>
 
             <div className="range">
@@ -597,7 +479,7 @@ async function logout() {
 
         {hasResult && (
           <div className="gridFixed">
-            {tiles.map(({ color, top, fromRange }) => {
+            {tiles.map(({ color, top }) => {
               const bg = top?.hex || BUCKET_BORDER[color] || "#111111";
               const fg = pickTextColor(bg);
               const border = BUCKET_BORDER[color] || "#FFFFFF";
@@ -606,20 +488,12 @@ async function logout() {
                 <div
                   key={color}
                   className="tile"
-                  style={{
-                    background: bg,
-                    color: fg,
-                    borderColor: border,
-                  }}
+                  style={{ background: bg, color: fg, borderColor: border }}
                 >
                   <div className="tileHead">
                     <div className="dot" style={{ background: border }} />
                     <div className="tileTitle">{titleCase(color)}</div>
-
-                    <div className="hex">
-                      {top?.hex ? top.hex : ""}
-
-                    </div>
+                    <div className="hex">{top?.hex ? top.hex : ""}</div>
                   </div>
 
                   <div className="imageWrap">
