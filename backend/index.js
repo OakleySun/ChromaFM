@@ -43,14 +43,28 @@ const COLOR_ORDER = [
 // ===============================
 // Rate-limit defenses (Spotify)
 // ===============================
-const SPOTIFY_CACHE = new Map(); // key -> { v, t }
-const SPOTIFY_INFLIGHT = new Map(); // key -> Promise
+
+// Cache = Map(key -> { v: responseJSON, t: timestamp })
+// Inflight = Map(key -> Promise) so multiple requests reuse the same fetch.
+const SPOTIFY_CACHE = new Map();
+const SPOTIFY_INFLIGHT = new Map();
 const SPOTIFY_CACHE_TTL = 20_000;
 
+/**
+ * tokenKey(accessToken)
+ * - Goal: create a stable-ish per-user key without storing the full token.
+ * - Implementation: last 12 characters of the access token.
+ * - Why: used to avoid cross-user cache collisions, and keeps memory lighter.
+ */
 function tokenKey(accessToken) {
   return accessToken ? accessToken.slice(-12) : "no_token";
 }
 
+/**
+ * spotifyCacheGet(key)
+ * - Returns cached value if within TTL, else null.
+ * - Also performs lazy cleanup: if expired, delete it immediately.
+ */
 function spotifyCacheGet(key) {
   const hit = SPOTIFY_CACHE.get(key);
   if (!hit) return null;
@@ -61,6 +75,11 @@ function spotifyCacheGet(key) {
   return hit.v;
 }
 
+/**
+ * spotifyCacheSet(key, value)
+ * - Saves JSON response with timestamp.
+ * - Also keeps cache bounded (simple FIFO eviction when size > 2500).
+ */
 function spotifyCacheSet(key, value) {
   SPOTIFY_CACHE.set(key, { v: value, t: Date.now() });
   if (SPOTIFY_CACHE.size > 2500) {
@@ -68,12 +87,22 @@ function spotifyCacheSet(key, value) {
   }
 }
 
+/**
+ * spotifyFetchJson(accessToken, url, cacheKey)
+ * - The “one wrapper to rule them all” for Spotify requests.
+ * - Features:
+ *   per-user caching (tokenKey + cacheKey)
+ *   inflight dedupe
+ *   retry-once for 429 rate limits (uses Retry-After)
+ */
 async function spotifyFetchJson(accessToken, url, cacheKey) {
   const k = `${tokenKey(accessToken)}:${cacheKey}`;
 
+  // Fast path: served from cache
   const cached = spotifyCacheGet(k);
   if (cached) return cached;
 
+  // If the same request is already in progress, re-use it.
   if (SPOTIFY_INFLIGHT.has(k)) return SPOTIFY_INFLIGHT.get(k);
 
   const p = (async () => {
@@ -82,7 +111,8 @@ async function spotifyFetchJson(accessToken, url, cacheKey) {
 
     let res = await doFetch();
 
-    // retry once on 429
+    // Spotify rate-limit behavior:
+    // 429 response includes "Retry-After" header in seconds.
     if (res.status === 429) {
       const ra = parseInt(res.headers.get("Retry-After") || "1", 10);
       const waitMs = Math.min(5000, Math.max(200, ra * 1000));
@@ -105,6 +135,7 @@ async function spotifyFetchJson(accessToken, url, cacheKey) {
   try {
     return await p;
   } finally {
+    // Always clean up, even if request throws.
     SPOTIFY_INFLIGHT.delete(k);
   }
 }
@@ -112,10 +143,18 @@ async function spotifyFetchJson(accessToken, url, cacheKey) {
 // ===============================
 // Compute dedupe (refresh storms)
 // ===============================
+
+// This is separate from Spotify caching.
+// It dedupes *your own heavy computations* like color bucketing + enrichment.
 const COMPUTE_CACHE = new Map(); // key -> { v, t }
 const COMPUTE_INFLIGHT = new Map(); // key -> Promise
 const COMPUTE_TTL = 12_000;
 
+/**
+ * computeCacheGet(key)
+ * - Like spotifyCacheGet, but for computed results.
+ * - Prevents recomputing buckets when user refreshes rapidly.
+ */
 function computeCacheGet(key) {
   const hit = COMPUTE_CACHE.get(key);
   if (!hit) return null;
@@ -125,6 +164,11 @@ function computeCacheGet(key) {
   }
   return hit.v;
 }
+
+/**
+ * computeCacheSet(key, value)
+ * - Stores computed results + keeps cache size small (<=120).
+ */
 function computeCacheSet(key, value) {
   COMPUTE_CACHE.set(key, { v: value, t: Date.now() });
   if (COMPUTE_CACHE.size > 120) {
@@ -135,6 +179,12 @@ function computeCacheSet(key, value) {
 // ===============================
 // Spotify API wrappers (cached)
 // ===============================
+
+/**
+ * fetchTopTracks(accessToken, time_range, limit, offset)
+ * - Calls /v1/me/top/tracks for a given range and page.
+ * - Uses spotifyFetchJson => gets caching + inflight + 429 retry.
+ */
 async function fetchTopTracks(accessToken, time_range, limit = 50, offset = 0) {
   const url = `https://api.spotify.com/v1/me/top/tracks?limit=${limit}&offset=${offset}&time_range=${encodeURIComponent(
     time_range
@@ -142,11 +192,21 @@ async function fetchTopTracks(accessToken, time_range, limit = 50, offset = 0) {
   return spotifyFetchJson(accessToken, url, `top_tracks:${time_range}:${limit}:${offset}`);
 }
 
+/**
+ * fetchTopArtists(accessToken, limit)
+ * - Calls /v1/me/top/artists.
+ * - Typically used for enrichment if top tracks / saved albums don’t cover buckets.
+ */
 async function fetchTopArtists(accessToken, limit = 10) {
   const url = `https://api.spotify.com/v1/me/top/artists?limit=${limit}`;
   return spotifyFetchJson(accessToken, url, `top_artists:${limit}`);
 }
 
+/**
+ * fetchArtistAlbums(accessToken, artistId, limit)
+ * - Gets albums/singles/compilations from an artist.
+ * - Used as a fallback pool to find missing colors.
+ */
 async function fetchArtistAlbums(accessToken, artistId, limit = 12) {
   const url =
     `https://api.spotify.com/v1/artists/${artistId}/albums` +
@@ -154,6 +214,11 @@ async function fetchArtistAlbums(accessToken, artistId, limit = 12) {
   return spotifyFetchJson(accessToken, url, `artist_albums:${artistId}:${limit}`);
 }
 
+/**
+ * fetchSavedAlbums(accessToken, limit, offset)
+ * - Calls /v1/me/albums (user library).
+ * - Used as fallback candidate pool.
+ */
 async function fetchSavedAlbums(accessToken, limit = 50, offset = 0) {
   const url = `https://api.spotify.com/v1/me/albums?limit=${limit}&offset=${offset}`;
   return spotifyFetchJson(accessToken, url, `saved_albums:${limit}:${offset}`);
@@ -162,15 +227,31 @@ async function fetchSavedAlbums(accessToken, limit = 50, offset = 0) {
 // ===============================
 // Helpers
 // ===============================
+
+/**
+ * escapeHtml(s)
+ * - Sanitizes strings for HTML response contexts.
+ * - Prevents breaking markup if album/artist includes < > &.
+ */
 function escapeHtml(s) {
   return s.replaceAll("&", "&amp;").replaceAll("<", "&lt;").replaceAll(">", "&gt;");
 }
 
+/**
+ * isOneTrackAlbum(albumLike)
+ * - Used to down-rank or filter “albums” that are really just singles.
+ */
 function isOneTrackAlbum(albumLike) {
   const t = albumLike?.total_tracks;
   return typeof t === "number" && t <= 1;
 }
 
+/**
+ * normalizeAlbumName(name)
+ * - Removes bracketed suffixes and “deluxe/remastered/edition/etc.”
+ * - Why: avoid treating the same album as different candidates.
+ * - Key mental model: “canonicalize” names for dedupe.
+ */
 function normalizeAlbumName(name) {
   return (name || "")
     .toLowerCase()
@@ -184,12 +265,22 @@ function normalizeAlbumName(name) {
     .trim();
 }
 
+/**
+ * rankWeight(index, total)
+ * - Turns a ranked list position into a weight (0..1) where earlier items matter much more.
+ * - Uses squared falloff so top ranks dominate.
+ */
 function rankWeight(index, total) {
   const t = total <= 1 ? 1 : index / (total - 1);
   const w = 1 - t;
   return w * w;
 }
 
+/**
+ * hashStringToInt(s)
+ * - Stable string hash -> unsigned 32-bit int.
+ * - Usually used for deterministic tie-breaking or pseudo-random but stable ordering.
+ */
 function hashStringToInt(s) {
   let h = 2166136261;
   for (let i = 0; i < s.length; i++) {
@@ -199,6 +290,11 @@ function hashStringToInt(s) {
   return h >>> 0;
 }
 
+/**
+ * strictnessForRange(timeRange)
+ * - Returns the tuning parameters for how “strict” color picking is.
+ * - Long-term allows more scanning/enrichment because there’s more history to draw from.
+ */
 function strictnessForRange(timeRange) {
   if (timeRange === "long_term") {
     return {
@@ -269,7 +365,6 @@ function pickPreferBestOrVariety(list, n, key, dominanceMargin = 0.25) {
   return list[idx];
 }
 
-// ✅ NEW: appearances override for EVERY color
 function getAppearances(a) {
   return typeof a?.appearances === "number" ? a.appearances : 0;
 }
@@ -1081,6 +1176,13 @@ app.listen(PORT, () => {
 // ===============================
 // Proxy images (for canvas export)
 // ===============================
+
+/**
+ * /api/proxy_image
+ * - Security + CORS fix for canvas export.
+ * - Only allows Spotify CDN hosts (prevents open proxy abuse).
+ * - Adds Cache-Control so repeated exports are fast.
+ */
 app.get("/api/proxy_image", async (req, res) => {
   try {
     const raw = (req.query.url || "").toString();

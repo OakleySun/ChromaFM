@@ -2,10 +2,12 @@ import { useEffect, useMemo, useRef, useState } from "react";
 import "./App.css";
 
 const API_BASE = "http://127.0.0.1:8000";
-const CACHE_KEY = "chromafm_bundle_v1";
+const CACHE_KEY = "chromafm_bundle";
 
 const ORDER = ["white", "grey", "black", "red", "orange", "yellow", "green", "blue", "purple", "pink"];
 
+// Used for tile borders / fallback colors when we don't have a good album-derived hex.
+// This ensures every bucket still has consistent color branding.
 const BUCKET_BORDER = {
   white: "#FFFFFF",
   grey: "#9E9E9E",
@@ -19,16 +21,27 @@ const BUCKET_BORDER = {
   pink: "#EC407A",
 };
 
+// This defines the fallback order (ex: short_term falls back to medium_term, then long_term).
 const TIME_ORDER = {
   short_term: ["short_term", "medium_term", "long_term"],
   medium_term: ["medium_term", "short_term", "long_term"],
   long_term: ["long_term", "medium_term", "short_term"],
 };
 
+/**
+ * titleCase(color)
+ * - Goal: turn bucket keys into display labels.
+ */
 function titleCase(color) {
   return color === "grey" ? "Grey" : color.charAt(0).toUpperCase() + color.slice(1);
 }
 
+/**
+ * parseHex(hex)
+ * - Input: "#RRGGBB" or "RRGGBB"
+ * - Output: {r,g,b} in 0-255, or null if invalid.
+ * - Why: used by pickTextColor to compute luminance.
+ */
 function parseHex(hex) {
   if (!hex || typeof hex !== "string") return null;
   const h = hex.trim().replace("#", "");
@@ -38,11 +51,23 @@ function parseHex(hex) {
   return { r: (n >> 16) & 255, g: (n >> 8) & 255, b: n & 255 };
 }
 
+/**
+ * srgbToLin(c)
+ * - Converts one channel from sRGB space to linear-light space.
+ * - Why: correct luminance math requires linear space (not raw 0-255).
+ */
 function srgbToLin(c) {
   const x = c / 255;
   return x <= 0.04045 ? x / 12.92 : Math.pow((x + 0.055) / 1.055, 2.4);
 }
 
+/**
+ * pickTextColor(bgHex)
+ * - Goal: choose black or near-white text depending on background brightness.
+ * - Uses relative luminance formula:
+ *   L = 0.2126*R + 0.7152*G + 0.0722*B (in linear space)
+ * - Threshold (0.58) is a design choice: higher = more often dark text.
+ */
 function pickTextColor(bgHex) {
   const rgb = parseHex(bgHex);
   if (!rgb) return "#F3F3F3";
@@ -50,22 +75,40 @@ function pickTextColor(bgHex) {
   return L > 0.58 ? "#0E0E0E" : "#F3F3F3";
 }
 
+/**
+ * timeRangeLabel(tr)
+ * - Converts API time range keys into UI/export labels.
+ */
 function timeRangeLabel(tr) {
   if (tr === "short_term") return "Last 4 weeks";
   if (tr === "medium_term") return "Last 6 months";
   return "All time";
 }
 
+/**
+ * proxyUrl(url)
+ * - Your canvas export needs image data that is CORS-safe.
+ * - This routes album art through your backend proxy endpoint.
+ */
 function proxyUrl(url) {
   return `${API_BASE}/api/proxy_image?url=${encodeURIComponent(url)}`;
 }
 
+/**
+ * loadImageBitmapViaProxy(url)
+ * - Fetch the image via backend proxy, then convert to ImageBitmap.
+ */
 async function loadImageBitmapViaProxy(url) {
   const res = await fetch(proxyUrl(url));
   if (!res.ok) throw new Error("image fetch failed");
   return createImageBitmap(await res.blob());
 }
 
+/**
+ * preloadImagesFromBundle(bundle)
+ * - Prefetches album cover URLs to reduce flicker + speed up rendering.
+ * - Uses <img> preloading (browser cache), not canvas bitmaps.
+ */
 function preloadImagesFromBundle(bundle) {
   try {
     const urls = new Set();
@@ -86,13 +129,27 @@ function preloadImagesFromBundle(bundle) {
   } catch {}
 }
 
+/**
+ * getTopFrom(bundle, timeRange, color)
+ * - Normalizes backend shape differences:
+ *   some versions might return {result}, others {buckets}.
+ * - Returns the "top" album object for one bucket, or null.
+ */
 function getTopFrom(bundle, timeRange, color) {
   const data = bundle?.[timeRange];
   const result = data?.result || data?.buckets || null;
   const bucket = result?.[color];
+  // Supports two bucket formats:
+  // 1) { top: {...}, others: [...] }
+  // 2) [album1, album2, ...] (legacy)
   return bucket?.top ?? (Array.isArray(bucket) ? bucket[0] : null) ?? null;
 }
 
+/**
+ * getTopWithCrossTimeFallback(bundle, timeRange, color)
+ * - If selected timeRange has no album for that color, fall back to other ranges.
+ * - Returns { top, fromRange } so UI/export can know where it came from.
+ */
 function getTopWithCrossTimeFallback(bundle, timeRange, color) {
   for (const tr of TIME_ORDER[timeRange] || TIME_ORDER.short_term) {
     const top = getTopFrom(bundle, tr, color);
@@ -101,8 +158,13 @@ function getTopWithCrossTimeFallback(bundle, timeRange, color) {
   return { top: null, fromRange: null };
 }
 
-// ---------- Story Export (1080x1920) ----------
+// ---------- Export (1080x1920) ----------
 
+/**
+ * roundRect(ctx, x, y, w, h, r)
+ * - Creates a rounded rectangle path on the canvas context.
+ * - NOTE: doesn't fill or stroke; it only defines the path.
+ */
 function roundRect(ctx, x, y, w, h, r) {
   const rr = Math.max(0, Math.min(r, Math.min(w, h) / 2));
   ctx.beginPath();
@@ -114,6 +176,11 @@ function roundRect(ctx, x, y, w, h, r) {
   ctx.closePath();
 }
 
+/**
+ * drawCoverContain(ctx, bmp, x, y, size)
+ * - Draws a bitmap inside a square without cropping (contain, not cover).
+ * - Computes scale to fit the longer side, centers the result.
+ */
 function drawCoverContain(ctx, bmp, x, y, size) {
   const scale = Math.min(size / bmp.width, size / bmp.height);
   const dw = bmp.width * scale;
@@ -121,6 +188,11 @@ function drawCoverContain(ctx, bmp, x, y, size) {
   ctx.drawImage(bmp, x + (size - dw) / 2, y + (size - dh) / 2, dw, dh);
 }
 
+/**
+ * ellipsize(ctx, text, maxWidth)
+ * - Truncates text to fit a max pixel width, adding "…".
+ * - Uses ctx.measureText so it’s accurate for the current font.
+ */
 function ellipsize(ctx, text, maxWidth) {
   if (!text) return "";
   if (ctx.measureText(text).width <= maxWidth) return text;
@@ -129,6 +201,11 @@ function ellipsize(ctx, text, maxWidth) {
   return s.length ? s + "…" : "";
 }
 
+/**
+ * fitOneLineText(ctx, text, maxWidth, startPx, minPx)
+ * - Shrinks font size until the string fits in one line.
+ * - Returns the final size used (so you can scale related text).
+ */
 function fitOneLineText(ctx, text, maxWidth, startPx, minPx) {
   let size = startPx;
   while (size > minPx) {
@@ -140,6 +217,12 @@ function fitOneLineText(ctx, text, maxWidth, startPx, minPx) {
   return size;
 }
 
+/**
+ * wrapAtSpaces(ctx, text, maxWidth, fontPx, maxLines)
+ * - Simple word-wrapping: builds lines until they exceed width.
+ * - Stops at maxLines (prevents huge blocks).
+ * - Returns array of lines or null if no words.
+ */
 function wrapAtSpaces(ctx, text, maxWidth, fontPx, maxLines) {
   const words = String(text || "").trim().split(/\s+/).filter(Boolean);
   if (!words.length) return null;
@@ -163,6 +246,17 @@ function wrapAtSpaces(ctx, text, maxWidth, fontPx, maxLines) {
   return lines.length ? lines : null;
 }
 
+/**
+ * buildPng({ tiles, timeRange })
+ * - Main exporter: renders a 1080x1920 image.
+ * - Steps:
+ *   1) create canvas + paint background
+ *   2) draw header (title + subtitle + time range)
+ *   3) compute 2x5 grid layout
+ *   4) preload cover bitmaps via proxy 
+ *   5) draw each tile (bg color, border, cover, fitted title/artist/hex)
+ * - Returns the canvas so caller can download it.
+ */
 async function buildPng({ tiles, timeRange }) {
   const W = 1080;
   const H = 1920;
@@ -315,6 +409,11 @@ async function buildPng({ tiles, timeRange }) {
   return canvas;
 }
 
+/**
+ * downloadCanvasPng(canvas, filename)
+ * - Converts canvas to a Blob, then downloads via temporary <a>.
+ * - URL.createObjectURL avoids base64 memory overhead.
+ */
 function downloadCanvasPng(canvas, filename) {
   canvas.toBlob((blob) => {
     if (!blob) return;
