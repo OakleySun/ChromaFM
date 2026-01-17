@@ -34,7 +34,7 @@ Instead of simply displaying the user's stats and rankings, ChromaFM analyzes al
   <img src="https://github.com/user-attachments/assets/648a4f5d-c135-4668-b5f6-e390eb3b496c" width="80%" />
 </p>
 
-**4. If you want to share your results, press Download Image to get a clean shareable picture. **
+**4. If you want to share your results, press Download Image to get a clean shareable picture**
 <p align="center">
   <img src="https://github.com/user-attachments/assets/e7367e95-d63a-4bd7-86b9-c40560ac7c35" width="80%" />
 </p>
